@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Trump Apples</title>
+<title>Recursive Apple</title>
 <style>
   :root{
     --fg: #39ff6a;
@@ -58,7 +58,7 @@
 
 <div id="overlay">
   <div>
-    <h1 id="overlayTitle">Trump Apples</h1>
+    <h1 id="overlayTitle">Recursive Apple</h1>
     <p id="overlayText">loading…</p>
   </div>
 </div>
@@ -128,7 +128,7 @@
   function showError(message) {
     overlay.classList.remove('hidden');
     overlay.classList.add('error');
-    overlayTitle.textContent = 'Trump Apples';
+    overlayTitle.textContent = 'Recursive Apple';
     overlayText.textContent = message;
     bar.classList.add('hidden');
   }
@@ -332,7 +332,7 @@
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = 'trump-apples.' + ext;
+    a.download = 'Recursive-Apple.' + ext;
     document.body.appendChild(a);
     a.click();
     a.remove();
@@ -361,7 +361,7 @@
       }).catch(() => {
         overlay.classList.remove('hidden');
         overlay.classList.remove('error');
-        overlayTitle.textContent = 'Trump Apples';
+        overlayTitle.textContent = 'Recursive Apple';
         overlayText.textContent = 'click to start';
         overlay.addEventListener('click', startFromGesture, { once: true });
       });
