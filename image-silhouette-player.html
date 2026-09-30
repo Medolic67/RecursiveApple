@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trump Apples</title>
+<style>
+  :root{
+    --fg: #39ff6a;
+    --fg-dim: #1f7a3a;
+    --border: #1f4a2c;
+    --panel: rgba(10,13,10,0.85);
+  }
+  *{ box-sizing:border-box; }
+  html,body{
+    margin:0; padding:0; width:100%; height:100%; background:#000; overflow:hidden;
+    font-family: ui-monospace, "SF Mono", Consolas, monospace;
+  }
+  #stage{
+    width:100vw; height:100vh; display:flex; align-items:center; justify-content:center;
+  }
+  #gridCanvas{
+    display:block;
+    width: min(100vw, 100vh * (4 / 3));
+    height: min(100vh, 100vw * (3 / 4));
+  }
+
+  #overlay{
+    position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
+    background:#000; color:var(--fg); z-index:10; text-align:center; cursor:pointer;
+  }
+  #overlay.hidden{ display:none; }
+  #overlay h1{ font-size:16px; letter-spacing:0.06em; margin:0 0 8px; font-weight:600; }
+  #overlay p{ font-size:12px; color:var(--fg-dim); margin:0; }
+  #overlay.error{ cursor:default; }
+  #overlay.error h1{ color:#ff5c5c; }
+
+  #bar{
+    position:fixed; left:50%; bottom:16px; transform:translateX(-50%);
+    display:flex; align-items:center; gap:10px; padding:8px 14px;
+    background:var(--panel); border:1px solid var(--border); border-radius:3px;
+    color:var(--fg); font-size:12px; z-index:5; opacity:0.55; transition:opacity 0.15s;
+  }
+  #bar.hidden{ display:none; }
+  #bar:hover{ opacity:1; }
+  #bar button{
+    background:transparent; border:1px solid var(--fg-dim); color:var(--fg);
+    padding:5px 12px; font-family:inherit; font-size:12px; cursor:pointer; border-radius:2px;
+  }
+  #bar button:hover{ border-color:var(--fg); }
+</style>
+</head>
+<body>
+
+<div id="stage">
+  <canvas id="gridCanvas" width="480" height="360"></canvas>
+</div>
+
+<div id="overlay">
+  <div>
+    <h1 id="overlayTitle">Trump Apples</h1>
+    <p id="overlayText">loading…</p>
+  </div>
+</div>
+
+<div id="bar" class="hidden">
+  <button id="pauseBtn">pause</button>
+  <button id="restartBtn">restart</button>
+  <span id="recIndicator" style="display:none;color:#ff5c5c;">● rec</span>
+</div>
+
+<video id="video" src="audio.mp4" playsinline style="display:none"></video>
+
+<script>
+(() => {
+  const WHITE_THRESHOLD = 153; // matches the original convert.py: gray > 153 -> white
+  const EXTRACT_INTERVAL_MS = 1000 / 30; // sample the video at ~30fps
+
+  const canvas = document.getElementById('gridCanvas');
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height; // fixed native resolution: 480x360
+  const overlay = document.getElementById('overlay');
+  const overlayTitle = document.getElementById('overlayTitle');
+  const overlayText = document.getElementById('overlayText');
+  const bar = document.getElementById('bar');
+  const pauseBtn = document.getElementById('pauseBtn');
+  const restartBtn = document.getElementById('restartBtn');
+  const video = document.getElementById('video');
+  const recIndicator = document.getElementById('recIndicator');
+
+  let lastExtractTime = -1;
+  let mediaRecorder = null;
+  let recordedChunks = [];
+  let recordingStarted = false;
+
+  // Hysteresis for the majority-color decision, so a shot hovering near 50/50 doesn't
+  // flip the recursive fill between colors every single frame.
+  let fillIsWhite = true;
+  let fillInitialized = false;
+  let pendingFlipTo = null;
+  let pendingCount = 0;
+  const FLIP_MARGIN = 0.05;     // challenger must lead by at least this many extra percentage points
+  const FLIP_HOLD_FRAMES = 10;  // ...and hold that lead for this many consecutive samples before switching
+
+  // offscreen canvas the video frame is drawn onto each sample, at full native resolution
+  const extractCanvas = document.createElement('canvas');
+  extractCanvas.width = W;
+  extractCanvas.height = H;
+  const extractCtx = extractCanvas.getContext('2d', { willReadFrequently: true });
+
+  // reused scratch buffers so nothing is re-allocated 30x/sec
+  const isWhite = new Uint8Array(W * H);
+  const isFill = new Uint8Array(W * H);   // this frame's "gets recursively filled" mask
+  const label = new Int16Array(W * H);
+  const stack = new Int32Array(W * H);
+
+  // Double-buffered recursive feedback: each frame's fill regions sample from the PREVIOUS
+  // frame's fully-rendered output, which itself contains smaller copies of the frame before
+  // that — so the recursion builds up naturally over playback rather than being computed in
+  // one pass. Both start solid black; there's nothing to recurse into yet on frame 1.
+  const bufA = new Uint8ClampedArray(W * H * 4);
+  const bufB = new Uint8ClampedArray(W * H * 4);
+  for (let i = 3; i < bufA.length; i += 4) { bufA[i] = 255; bufB[i] = 255; }
+  const imgDataA = new ImageData(bufA, W, H);
+  const imgDataB = new ImageData(bufB, W, H);
+  let readBuf = bufA, writeBuf = bufB, writeImgData = imgDataB;
+
+  function showError(message) {
+    overlay.classList.remove('hidden');
+    overlay.classList.add('error');
+    overlayTitle.textContent = 'Trump Apples';
+    overlayText.textContent = message;
+    bar.classList.add('hidden');
+  }
+
+  function loadVideoMetadata() {
+    return new Promise((resolve, reject) => {
+      if (video.readyState >= 1) return resolve();
+      video.addEventListener('loadedmetadata', () => resolve(), { once: true });
+      video.addEventListener('error', () => reject(new Error(
+        'could not load this file as a video (unsupported codec/container in this browser)'
+      )), { once: true });
+    });
+  }
+
+  // Draw the video's current frame at full native resolution and threshold every pixel.
+  function extractIsWhite() {
+    extractCtx.drawImage(video, 0, 0, W, H);
+    const data = extractCtx.getImageData(0, 0, W, H).data;
+    for (let p = 0, o = 0; p < W * H; p++, o += 4) {
+      const gray = 0.299 * data[o] + 0.587 * data[o + 1] + 0.114 * data[o + 2];
+      isWhite[p] = gray > WHITE_THRESHOLD ? 1 : 0;
+    }
+  }
+
+  // 4-connected (edge-adjacency only) component labeling over `isFill`.
+  // Returns bboxes[]; `label[y*W+x]` holds each pixel's component index, or -1 if not filled.
+  function computeComponents() {
+    label.fill(-1);
+    const bboxes = [];
+    let next = 0;
+    for (let start = 0; start < W * H; start++) {
+      if (!isFill[start] || label[start] !== -1) continue;
+      let minX = W, minY = H, maxX = -1, maxY = -1;
+      let sp = 0;
+      stack[sp++] = start;
+      label[start] = next;
+      while (sp > 0) {
+        const idx = stack[--sp];
+        const x = idx % W, y = (idx / W) | 0;
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+        if (x > 0) { const n = idx - 1; if (isFill[n] && label[n] === -1) { label[n] = next; stack[sp++] = n; } }
+        if (x < W - 1) { const n = idx + 1; if (isFill[n] && label[n] === -1) { label[n] = next; stack[sp++] = n; } }
+        if (y > 0) { const n = idx - W; if (isFill[n] && label[n] === -1) { label[n] = next; stack[sp++] = n; } }
+        if (y < H - 1) { const n = idx + W; if (isFill[n] && label[n] === -1) { label[n] = next; stack[sp++] = n; } }
+      }
+      bboxes.push({ minX, minY, maxX, maxY });
+      next++;
+    }
+    return bboxes;
+  }
+
+  function drawFrame() {
+    extractIsWhite();
+
+    // whichever color covers more pixels *tends* to get the recursive fill — smoothed with
+    // hysteresis so a shot hovering near 50/50 doesn't flicker between colors every frame
+    let whiteCount = 0;
+    for (let p = 0; p < W * H; p++) whiteCount += isWhite[p];
+    const whiteFrac = whiteCount / (W * H);
+
+    if (!fillInitialized) {
+      fillIsWhite = whiteFrac >= 0.5;
+      fillInitialized = true;
+    } else {
+      let candidate = fillIsWhite;
+      if (whiteFrac > 0.5 + FLIP_MARGIN) candidate = true;
+      else if (whiteFrac < 0.5 - FLIP_MARGIN) candidate = false;
+
+      if (candidate !== fillIsWhite) {
+        if (pendingFlipTo === candidate) {
+          pendingCount++;
+        } else {
+          pendingFlipTo = candidate;
+          pendingCount = 1;
+        }
+        if (pendingCount >= FLIP_HOLD_FRAMES) {
+          fillIsWhite = candidate;
+          pendingFlipTo = null;
+          pendingCount = 0;
+        }
+      } else {
+        pendingFlipTo = null;
+        pendingCount = 0;
+      }
+    }
+
+    const bgVal = fillIsWhite ? 0 : 255; // the minority color, rendered flat
+
+    for (let p = 0; p < W * H; p++) {
+      isFill[p] = (isWhite[p] === (fillIsWhite ? 1 : 0)) ? 1 : 0;
+    }
+
+    const bboxes = computeComponents();
+
+    // precompute each component's cover-fit placement once, not per-pixel
+    const drawX = new Float32Array(bboxes.length);
+    const drawY = new Float32Array(bboxes.length);
+    const invScale = new Float32Array(bboxes.length);
+    for (let lbl = 0; lbl < bboxes.length; lbl++) {
+      const { minX, minY, maxX, maxY } = bboxes[lbl];
+      const boxW = maxX - minX + 1, boxH = maxY - minY + 1;
+      const scale = Math.max(boxW / W, boxH / H); // source (readBuf) is always W x H
+      const dW = W * scale, dH = H * scale;
+      drawX[lbl] = minX + (boxW - dW) / 2;
+      drawY[lbl] = minY + (boxH - dH) / 2;
+      invScale[lbl] = 1 / scale;
+    }
+
+    for (let y = 0, p = 0; y < H; y++) {
+      for (let x = 0; x < W; x++, p++) {
+        const o = p * 4;
+        const lbl = label[p];
+        if (lbl === -1) {
+          writeBuf[o] = bgVal; writeBuf[o + 1] = bgVal; writeBuf[o + 2] = bgVal; writeBuf[o + 3] = 255;
+          continue;
+        }
+        let sx = (x - drawX[lbl]) * invScale[lbl] | 0;
+        let sy = (y - drawY[lbl]) * invScale[lbl] | 0;
+        if (sx < 0) sx = 0; else if (sx >= W) sx = W - 1;
+        if (sy < 0) sy = 0; else if (sy >= H) sy = H - 1;
+        const so = (sy * W + sx) * 4;
+        writeBuf[o] = readBuf[so];
+        writeBuf[o + 1] = readBuf[so + 1];
+        writeBuf[o + 2] = readBuf[so + 2];
+        writeBuf[o + 3] = 255;
+      }
+    }
+
+    ctx.putImageData(writeImgData, 0, 0);
+
+    // swap: this frame's output becomes next frame's recursion source
+    const tmp = readBuf;
+    readBuf = writeBuf;
+    writeBuf = tmp;
+    writeImgData = (writeBuf === bufA) ? imgDataA : imgDataB;
+  }
+
+  function renderLoop(ts) {
+    if (!video.paused && !video.ended) {
+      if (ts - lastExtractTime >= EXTRACT_INTERVAL_MS) {
+        lastExtractTime = ts;
+        drawFrame();
+      }
+    }
+    requestAnimationFrame(renderLoop);
+  }
+
+  function pickMimeType() {
+    const candidates = [
+      'video/mp4;codecs=h264,aac',
+      'video/webm;codecs=vp9,opus',
+      'video/webm;codecs=vp8,opus',
+      'video/webm'
+    ];
+    for (const t of candidates) {
+      if (window.MediaRecorder && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(t)) return t;
+    }
+    return '';
+  }
+
+  // Records the canvas + the source video's own audio track from the moment playback truly
+  // starts, and auto-downloads the result once the video ends. Runs once per page load.
+  function startRecording() {
+    if (recordingStarted) return;
+    if (!canvas.captureStream || !window.MediaRecorder) return; // unsupported browser, skip quietly
+    recordingStarted = true;
+    try {
+      const vStream = canvas.captureStream(30);
+      let aTracks = [];
+      const captureAV = video.captureStream || video.mozCaptureStream;
+      if (captureAV) {
+        aTracks = captureAV.call(video).getAudioTracks();
+      }
+      const combined = new MediaStream([...vStream.getVideoTracks(), ...aTracks]);
+      const mimeType = pickMimeType();
+      mediaRecorder = mimeType ? new MediaRecorder(combined, { mimeType }) : new MediaRecorder(combined);
+      recordedChunks = [];
+      mediaRecorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) recordedChunks.push(e.data); };
+      mediaRecorder.onstop = saveRecording;
+      mediaRecorder.start();
+      if (recIndicator) recIndicator.style.display = 'inline';
+    } catch (e) {
+      recordingStarted = false;
+      console.warn('recording unavailable:', e);
+    }
+  }
+
+  function stopRecording() {
+    if (mediaRecorder && mediaRecorder.state === 'recording') mediaRecorder.stop();
+  }
+
+  function saveRecording() {
+    if (recIndicator) recIndicator.style.display = 'none';
+    if (!recordedChunks.length) return;
+    const mimeType = mediaRecorder.mimeType || 'video/webm';
+    const ext = mimeType.includes('mp4') ? 'mp4' : 'webm';
+    const blob = new Blob(recordedChunks, { type: mimeType });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'trump-apples.' + ext;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+  }
+
+  video.addEventListener('ended', stopRecording);
+
+  async function begin() {
+    try {
+      await loadVideoMetadata();
+      requestAnimationFrame(renderLoop);
+      bar.classList.remove('hidden');
+      tryAutoplay();
+    } catch (e) {
+      showError('something went wrong loading this — ' + e.message);
+    }
+  }
+
+  function tryAutoplay() {
+    const p = video.play();
+    if (p && typeof p.catch === 'function') {
+      p.then(() => {
+        overlay.classList.add('hidden');
+        startRecording();
+      }).catch(() => {
+        overlay.classList.remove('hidden');
+        overlay.classList.remove('error');
+        overlayTitle.textContent = 'Trump Apples';
+        overlayText.textContent = 'click to start';
+        overlay.addEventListener('click', startFromGesture, { once: true });
+      });
+    } else {
+      overlay.classList.add('hidden');
+    }
+  }
+
+  function startFromGesture() {
+    video.play();
+    overlay.classList.add('hidden');
+    startRecording();
+  }
+
+  pauseBtn.addEventListener('click', () => {
+    if (video.paused) {
+      video.play();
+      pauseBtn.textContent = 'pause';
+    } else {
+      video.pause();
+      pauseBtn.textContent = 'play';
+    }
+  });
+
+  restartBtn.addEventListener('click', () => {
+    video.currentTime = 0;
+    video.play();
+    pauseBtn.textContent = 'pause';
+  });
+
+  window.addEventListener('keydown', (e) => {
+    if (e.code === 'Space' && !bar.classList.contains('hidden')) {
+      e.preventDefault();
+      pauseBtn.click();
+    }
+  });
+
+  begin();
+})();
+</script>
+</body>
+</html>
